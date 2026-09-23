@@ -1,0 +1,105 @@
+name: Build ArduPilot SITL for Raspberry Pi 3B (ARM32v7)
+
+on:
+  workflow_dispatch:  # Manual trigger from GitHub Actions tab
+    inputs:
+      ardupilot_version:
+        description: 'ArduPilot tag/branch to build (e.g., Copter-4.5, master)'
+        required: true
+        default: 'Copter-4.5'
+        type: choice
+        options:
+          - 'Copter-4.5'
+          - 'Copter-4.4'
+          - 'master'
+
+jobs:
+  build-arm32v7:
+    name: Build for ARM32v7 (Pi 3B)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # 1. Checkout ArduPilot at the selected version
+      - name: Checkout ArduPilot
+        uses: actions/checkout@v4
+        with:
+          repository: ArduPilot/ardupilot
+          ref: ${{ github.event.inputs.ardupilot_version }}
+          submodules: recursive
+          fetch-depth: 1
+
+      # 2. Set up Docker Buildx for multi-arch
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 3. Build the arducopter binary for ARM32v7 using ArduPilot's Docker image
+      - name: Build arducopter for ARM32v7
+        id: build
+        run: |
+          # ArduPilot's Docker image has all build deps pre-installed
+          docker run --rm --platform linux/arm/v7 \
+            -v "${{ github.workspace }}:/ardupilot" \
+            -w /ardupilot \
+            ardupilot/ardupilot:latest \
+            bash -c "
+              ./waf configure --board sitl &&
+              ./waf copter &&
+              cp build/sitl/bin/arducopter /ardupilot/arducopter-arm32v7
+            "
+
+      # 4. Verify the binary is ARM 32-bit
+      - name: Verify binary architecture
+        run: |
+          file arducopter-arm32v7
+          ls -lh arducopter-arm32v7
+
+      # 5. Upload as artifact (downloadable from Actions UI)
+      - name: Upload arducopter binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: arducopter-arm32v7
+          path: arducopter-arm32v7
+          retention-days: 30
+
+      # 6. Also upload the parameter file for convenience
+      - name: Upload IDS parameter file
+        uses: actions/upload-artifact@v4
+        with:
+          name: ids-copter-param
+          path: |
+            params/ids_copter.parm
+          retention-days: 30
+
+  # Optional: Build a Docker image you can run directly on Pi
+  build-docker-image:
+    name: Build Docker image for Pi (optional)
+    runs-on: ubuntu-latest
+    needs: build-arm32v7
+    if: github.event.inputs.ardupilot_version != 'master'  # Skip for master (tagged releases only)
+    steps:
+      - name: Download binary from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: arducopter-arm32v7
+          path: /tmp/artifacts
+
+      - name: Download param file
+        uses: actions/download-artifact@v4
+        with:
+          name: ids-copter-param
+          path: /tmp/params
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.pi3b
+          platforms: linux/arm/v7
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/ardupilot-sitl:${{ github.event.inputs.ardupilot_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
